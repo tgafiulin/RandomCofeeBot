@@ -1,0 +1,81 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String   @id @default(cuid())
+  telegramUserId BigInt   @unique
+  username       String?
+  firstName      String
+  lastName       String?
+  /// Whitelisted group chat id (string) selected in DM for /schedule, /cron, etc.
+  dmCronTargetChatId String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  participations RoundParticipation[]
+}
+
+enum RoundStatus {
+  POLL_OPEN
+  MATCHED
+}
+
+enum ParticipationChoice {
+  PARTICIPATE
+  NOT_PARTICIPATE
+}
+
+/// One weekly cycle for a specific Telegram group (identified by telegramChatId).
+model Round {
+  id              String      @id @default(cuid())
+  telegramChatId  BigInt
+  status          RoundStatus @default(POLL_OPEN)
+  createdAt       DateTime    @default(now())
+  matchedAt       DateTime?
+  /// Telegram message id of the poll (same chat as `telegramChatId`).
+  pollMessageId   BigInt?
+  /// Telegram `poll.id` for matching `poll_answer` updates.
+  telegramPollId  String?     @unique
+
+  participations RoundParticipation[]
+
+  @@index([telegramChatId])
+  @@index([telegramChatId, status])
+}
+
+model RoundParticipation {
+  id     String              @id @default(cuid())
+  roundId String
+  userId String
+  choice ParticipationChoice
+
+  round Round @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roundId, userId])
+}
+
+/// Weekly poll/match times per Telegram group (set via bot /schedule).
+model GroupCronSettings {
+  id             String @id @default(cuid())
+  /// Telegram chat id as string (supergroup ids exceed 32-bit; TEXT avoids SQLite/Prisma INT issues).
+  telegramChatId String @unique
+  /// If true, no automatic poll/match for this chat.
+  cronDisabled   Boolean @default(false)
+  /// Optional IANA override for this group (`/crontz`); if null, DEFAULT_CRON_TIMEZONE in code is used.
+  timezone       String?
+  /// 0 = Sunday … 6 = Saturday (node-cron). Null = no automatic poll until set in bot.
+  pollWeekday    Int?
+  pollHour       Int?
+  pollMinute     Int    @default(0)
+  matchWeekday   Int?
+  matchHour      Int?
+  matchMinute    Int    @default(0)
+  updatedAt      DateTime @updatedAt
+}

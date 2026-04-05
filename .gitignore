@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.log
+# Локальная БД — не коммитить (у каждого разработчика и окружения своя)
+prisma/dev.db
+prisma/dev.db-journal
+prisma/**/*.db
+prisma/**/*.db-journal
