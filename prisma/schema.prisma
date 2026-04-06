@@ -61,6 +61,13 @@ model RoundParticipation {
   @@unique([roundId, userId])
 }
 
+/// Who added the bot to this Telegram group (`my_chat_member`). DM settings require this user to still be admin/creator.
+model GroupChatMeta {
+  telegramChatId           String   @id
+  botAddedByTelegramUserId BigInt
+  updatedAt                DateTime @updatedAt
+}
+
 /// Weekly poll/match times per Telegram group (set via bot /schedule).
 model GroupCronSettings {
   id             String @id @default(cuid())

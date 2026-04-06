@@ -46,6 +46,13 @@ CREATE TABLE "GroupCronSettings" (
     "updatedAt" DATETIME NOT NULL
 );
 
+-- CreateTable
+CREATE TABLE "GroupChatMeta" (
+    "telegramChatId" TEXT NOT NULL PRIMARY KEY,
+    "botAddedByTelegramUserId" BIGINT NOT NULL,
+    "updatedAt" DATETIME NOT NULL
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "User_telegramUserId_key" ON "User"("telegramUserId");
 

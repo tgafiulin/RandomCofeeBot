@@ -1,8 +1,12 @@
 import "dotenv/config";
+import type { Message } from "grammy/types";
 import { Bot, GrammyError, HttpError } from "grammy";
 import { prisma } from "./db/client.js";
 import { upsertUserFromTelegram } from "./upsertUser.js";
-import { parseAdminTelegramIds } from "./admins.js";
+import {
+  canConfigureGroupAsAdderAndAdmin,
+  userCanAccessAnyDmSettings,
+} from "./groupChatAuth.js";
 import { createPollAnswerHandler } from "./handlers/pollAnswer.js";
 import { rescheduleCronJobs, stopCronJobs } from "./scheduler.js";
 import { registerCronSettingCommands } from "./commands/cronSettings.js";
@@ -43,26 +47,24 @@ if (allowedGroupIds === null) {
   console.log(`Group whitelist active: ${[...allowedGroupIds].join(", ")}`);
 }
 
-const adminTelegramIds = parseAdminTelegramIds();
-if (adminTelegramIds.size === 0) {
-  console.warn("ADMIN_TELEGRAM_IDS is empty — настройки cron в личке (/settings, /schedule, …) будут недоступны.");
-} else {
-  console.log(`Admins (user ids): ${[...adminTelegramIds].join(", ")}`);
+/** For DM auth: null = env not set (any group); non-null = restrict to these ids (possibly empty). */
+function dmAuthWhitelistChatIds(): number[] | null {
+  if (allowedGroupIds === null) return null;
+  return [...allowedGroupIds];
 }
 
 const HELP_TEXT = [
   "Random Coffee — помощь",
   "",
-  "В сообществе:",
-  "/help — эта памятка",
-  "/chatid — id этой группы для ALLOWED_GROUP_IDS в .env",
+  "В группе: только опросы и результаты.",
   "",
-  "Расписание и cron — только в личке с ботом:",
+  "В личке (тот, кто добавил бота в группу и сейчас админ/создатель в Telegram):",
+  "/help — эта памятка",
   "/settings — выбрать группу",
   "/cron, /schedule, /scheduleoff, /scheduleon, /crontz",
   "",
   "Участники отвечают на опрос в группе кнопками.",
-  "Команда /start в личке — кратко о боте.",
+  "/start в личке — кратко о боте.",
 ].join("\n");
 
 async function trySendAdminDm(userId: number, text: string, api: Bot["api"]): Promise<boolean> {
@@ -74,50 +76,96 @@ async function trySendAdminDm(userId: number, text: string, api: Bot["api"]): Pr
   }
 }
 
-/** Создатель или администратор этого чата (по данным Telegram). */
-async function isTelegramChatAdmin(
-  api: Bot["api"],
-  chatId: number,
-  userId: number
-): Promise<boolean> {
-  try {
-    const m = await api.getChatMember(chatId, userId);
-    return m.status === "creator" || m.status === "administrator";
-  } catch {
-    return false;
+type ForwardedChatRef = { id: number; source: "chat" | "channel" | "sender_chat" };
+
+/**
+ * Telegram often sends MessageOriginUser when you forward a **member's** message from a group — there is no chat id then.
+ * MessageOriginChat: message sent as the group / anonymous admin; MessageOriginChannel: post from a channel.
+ */
+function groupChatIdFromForwardedMessage(msg: Message): ForwardedChatRef | undefined {
+  const o = msg.forward_origin;
+  if (!o) return undefined;
+
+  if (o.type === "chat") {
+    const t = o.sender_chat.type;
+    if (t === "group" || t === "supergroup") return { id: o.sender_chat.id, source: "chat" };
   }
+  if (o.type === "channel") {
+    return { id: o.chat.id, source: "channel" };
+  }
+
+  if (msg.sender_chat) {
+    const t = msg.sender_chat.type;
+    if (t === "group" || t === "supergroup") return { id: msg.sender_chat.id, source: "sender_chat" };
+    if (t === "channel") return { id: msg.sender_chat.id, source: "sender_chat" };
+  }
+
+  return undefined;
 }
 
 const bot = new Bot(token);
 
-/** Before whitelist: new groups can use /chatid before ALLOWED_GROUP_IDS is updated. */
-bot.command("chatid", async (ctx) => {
-  const chat = ctx.chat;
-  const from = ctx.from;
-  if (!chat || !from) return;
+let cachedBotUserId: number | undefined;
 
-  if (chat.type === "private") {
-    if (!adminTelegramIds.has(from.id)) return;
-    await ctx.reply(
-      "Сейчас это личка: виден только твой user id, не группы.\n\nВ нужной группе отправь /chatid — id группы придёт сюда, в личку (если написал боту /start)."
-    );
-    return;
+async function getBotUserId(): Promise<number> {
+  if (cachedBotUserId === undefined) {
+    cachedBotUserId = (await bot.api.getMe()).id;
   }
+  return cachedBotUserId;
+}
 
+/** До whitelist: id новой группы до добавления в ALLOWED_GROUP_IDS. */
+bot.on("my_chat_member", async (ctx) => {
+  const upd = ctx.myChatMember;
+  if (!upd) return;
+
+  const chat = upd.chat;
   if (chat.type !== "group" && chat.type !== "supergroup") return;
 
-  const canUse =
-    adminTelegramIds.has(from.id) || (await isTelegramChatAdmin(bot.api, chat.id, from.id));
-  if (!canUse) return;
+  const from = upd.from;
+  if (!from) return;
 
-  const text = [`ID этой группы: ${chat.id}`, "", `Добавь в .env: ALLOWED_GROUP_IDS=${chat.id}`].join(
-    "\n"
-  );
+  const botId = await getBotUserId();
+  const { old_chat_member: oldM, new_chat_member: newM } = upd;
+
+  if (newM.user.id !== botId) return;
+
+  const wasGone = oldM.status === "left" || oldM.status === "kicked";
+  const nowPresent =
+    newM.status === "member" || newM.status === "administrator" || newM.status === "restricted";
+  if (!wasGone || !nowPresent) return;
+
+  await upsertUserFromTelegram(from);
+
+  await prisma.groupChatMeta.upsert({
+    where: { telegramChatId: String(chat.id) },
+    create: {
+      telegramChatId: String(chat.id),
+      botAddedByTelegramUserId: BigInt(from.id),
+    },
+    update: { botAddedByTelegramUserId: BigInt(from.id) },
+  });
+
+  const title = "title" in chat && chat.title ? chat.title : "группа";
+  const text = [
+    `Бот добавлен в «${title}».`,
+    "",
+    `ID чата:`,
+    `${chat.id}`,
+    "",
+    `ALLOWED_GROUP_IDS=${chat.id}`,
+  ].join("\n");
+
   const ok = await trySendAdminDm(from.id, text, bot.api);
   if (!ok) {
-    await ctx.reply(
-      "Не удалось написать в личку. Напиши боту /start в личке и повтори /chatid — тогда id увидишь только ты."
-    );
+    try {
+      await ctx.api.sendMessage(
+        chat.id,
+        "Не удалось написать в личку. Напиши боту /start в личке, затем удали бота из группы и добавь снова — id чата придёт в личку."
+      );
+    } catch {
+      /* ignore */
+    }
   }
 });
 
@@ -126,24 +174,55 @@ bot.command("help", async (ctx) => {
   const from = ctx.from;
   if (!chat || !from) return;
 
-  if (chat.type === "private") {
-    if (!adminTelegramIds.has(from.id)) return;
-    await ctx.reply(HELP_TEXT);
-    return;
+  if (chat.type !== "private") return;
+
+  if (!(await userCanAccessAnyDmSettings(bot.api, from.id, dmAuthWhitelistChatIds()))) return;
+
+  await ctx.reply(HELP_TEXT);
+});
+
+bot.on("message:forward_origin").use(async (ctx, next) => {
+  if (ctx.chat?.type !== "private" || !ctx.from || !ctx.message) {
+    return next();
   }
 
-  if (chat.type !== "group" && chat.type !== "supergroup") return;
-
-  const canUse =
-    adminTelegramIds.has(from.id) || (await isTelegramChatAdmin(bot.api, chat.id, from.id));
-  if (!canUse) return;
-
-  const ok = await trySendAdminDm(from.id, HELP_TEXT, bot.api);
-  if (!ok) {
-    await ctx.reply(
-      "Не удалось написать в личку. Напиши боту /start в личке и повтори /help — тогда памятку увидишь только ты."
-    );
+  const ref = groupChatIdFromForwardedMessage(ctx.message);
+  if (ref === undefined) {
+    const o = ctx.message.forward_origin;
+    if (o?.type === "user" || o?.type === "hidden_user") {
+      await ctx.reply(
+        [
+          "Id группы неизвестен: Telegram при пересылке сообщения участника не передаёт id чата.",
+          "",
+          "Надёжно: напиши боту /start в личке, удали бота из группы и добавь снова — id чата придёт в личку тому, кто добавит.",
+          "",
+          "Иначе переслать сообщение от имени группы или пост из канала; либо проверить настройки приватности пересылки.",
+        ].join("\n")
+      );
+      return;
+    }
+    return next();
   }
+
+  const { id: groupId, source } = ref;
+
+  const canUse = await canConfigureGroupAsAdderAndAdmin(bot.api, groupId, ctx.from.id);
+  if (!canUse) {
+    return next();
+  }
+
+  const channelNote =
+    source === "channel" || source === "sender_chat"
+      ? "\n\nЕсли у вас связка «канал + группа обсуждений», для ALLOWED_GROUP_IDS обычно нужен id супергруппы обсуждений (он может отличаться от id канала)."
+      : "";
+
+  const text = [
+    `ID этого чата: ${groupId}`,
+    "",
+    `Добавь в .env: ALLOWED_GROUP_IDS=${groupId}`,
+    channelNote,
+  ].join("\n");
+  await ctx.reply(text);
 });
 
 if (allowedGroupIds !== null) {
@@ -168,11 +247,11 @@ bot.command("start", async (ctx) => {
 
   if (chat.type === "private") {
     const extra =
-      ctx.from && adminTelegramIds.has(ctx.from.id)
+      ctx.from && (await userCanAccessAnyDmSettings(bot.api, ctx.from.id, dmAuthWhitelistChatIds()))
         ? "\n\nНастройки cron (расписание опроса и пар): /settings — выбери группу, дальше /cron и /schedule."
         : "";
     await ctx.reply(
-      `Привет! Я бот Random Coffee. Добавь меня в группу сообщества — там будут опросы и пары на неделю.${extra}`
+      `Привет! Я бот Random Coffee. Добавь меня в группу сообщества — там будут опросы и пары на неделю. После этого в личку придёт id чата для настройки (ALLOWED_GROUP_IDS).${extra}`
     );
     return;
   }
@@ -200,7 +279,9 @@ bot.on("callback_query").use(async (ctx, next) => {
 });
 
 registerCronSettingCommands(bot, {
-  admins: adminTelegramIds,
+  api: bot.api,
+  canConfigureGroup: (userId, groupChatId) =>
+    canConfigureGroupAsAdderAndAdmin(bot.api, groupChatId, userId),
   whitelistChatIds: cronChatIds,
   reschedule: resyncCron,
 });

@@ -1,7 +1,6 @@
 import type { Bot, Context } from "grammy";
 import { InlineKeyboard } from "grammy";
 import { prisma } from "../db/client.js";
-import { isAdminUser } from "../admins.js";
 import {
   formatWeekdayRu,
   isValidIanaTimezone,
@@ -23,27 +22,20 @@ function pad2(n: number): string {
 }
 
 type Deps = {
-  admins: Set<number>;
+  api: Bot["api"];
+  canConfigureGroup: (userId: number, groupChatId: number) => Promise<boolean>;
   whitelistChatIds: number[];
   reschedule: () => Promise<void>;
 };
 
-function requirePrivateAdmin(ctx: Context, admins: Set<number>): boolean {
+function assertPrivateChat(ctx: Context): ctx is Context & { chat: { type: "private" }; from: NonNullable<Context["from"]> } {
   const chat = ctx.chat;
-  if (!chat || chat.type !== "private") {
-    return false;
-  }
-  if (admins.size === 0) {
-    void ctx.reply("Админы не настроены: задай ADMIN_TELEGRAM_IDS в .env.");
-    return false;
-  }
   const from = ctx.from;
-  if (!from || !isAdminUser(from.id, admins)) {
-    void ctx.reply("Эти команды только для админов.");
-    return false;
-  }
-  return true;
+  return !!(chat && chat.type === "private" && from);
 }
+
+const NO_ACCESS =
+  "Нет доступа к настройкам этой группы: нужно быть администратором или создателем и тем пользователем, который добавил бота в чат.";
 
 function tailAfterCommand(text: string): string {
   const trimmed = text.trim();
@@ -134,16 +126,28 @@ function weekdayKeyboard(prefix: "p" | "m"): InlineKeyboard {
 }
 
 export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
-  const { admins, whitelistChatIds, reschedule } = deps;
+  const { api, canConfigureGroup, whitelistChatIds, reschedule } = deps;
 
   bot.command("settings", async (ctx) => {
-    if (!requirePrivateAdmin(ctx, admins)) return;
-    const from = ctx.from!;
+    if (!assertPrivateChat(ctx)) return;
+    const from = ctx.from;
     await upsertUserFromTelegram(from);
 
     if (whitelistChatIds.length === 0) {
       await ctx.reply(
-        "В .env задай ALLOWED_GROUP_IDS (id группы можно узнать там же командой /chatid). После перезапуска бота открой /settings снова."
+        "В .env задай ALLOWED_GROUP_IDS (id чата приходит в личку при добавлении бота в группу после /start; либо пересылка от имени группы/канала). После перезапуска бота открой /settings снова."
+      );
+      return;
+    }
+
+    const allowedForUser: number[] = [];
+    for (const id of whitelistChatIds) {
+      if (await canConfigureGroup(from.id, id)) allowedForUser.push(id);
+    }
+
+    if (allowedForUser.length === 0) {
+      await ctx.reply(
+        "Нет доступных групп: для каждой группы в списке нужно быть администратором или создателем и тем, кто добавил бота в этот чат. Если бот был добавлен до этой логики — удали бота из группы и добавь снова."
       );
       return;
     }
@@ -152,21 +156,20 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
     const current = await getDmTargetChatIdString(from.id);
     if (current) {
       const id = Number(current);
-      if (Number.isFinite(id) && whitelistChatIds.includes(id)) {
-        const title = await groupTitle(bot.api, id);
+      if (Number.isFinite(id) && allowedForUser.includes(id)) {
+        const title = await groupTitle(api, id);
         lines.push("", `Сейчас: ${title}`, `id: ${id}`);
       } else {
-        lines.push("", "Сохранённый чат не из whitelist — выбери заново.");
+        lines.push("", "Сохранённый чат недоступен — выбери заново.");
       }
     } else {
       lines.push("", "Пока не выбрана — нажми кнопку ниже.");
     }
 
     const kb = new InlineKeyboard();
-    for (const id of whitelistChatIds) {
-      const title = await groupTitle(bot.api, id);
-      const label =
-        title.length > 48 ? `${title.slice(0, 45)}…` : title;
+    for (const id of allowedForUser) {
+      const title = await groupTitle(api, id);
+      const label = title.length > 48 ? `${title.slice(0, 45)}…` : title;
       kb.text(label, `setgrp:${id}`).row();
     }
 
@@ -174,11 +177,7 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.callbackQuery(/^setgrp:(-?\d+)$/, async (ctx) => {
-    if (!ctx.from || !admins.has(ctx.from.id)) {
-      await ctx.answerCallbackQuery({ text: "Только для админов.", show_alert: true });
-      return;
-    }
-    if (ctx.chat?.type !== "private") {
+    if (!ctx.from || ctx.chat?.type !== "private") {
       await ctx.answerCallbackQuery();
       return;
     }
@@ -186,6 +185,10 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
     const id = Number(ctx.match![1]);
     if (!whitelistChatIds.includes(id)) {
       await ctx.answerCallbackQuery({ text: "Этот чат не в ALLOWED_GROUP_IDS.", show_alert: true });
+      return;
+    }
+    if (!(await canConfigureGroup(from.id, id))) {
+      await ctx.answerCallbackQuery({ text: NO_ACCESS, show_alert: true });
       return;
     }
 
@@ -196,7 +199,7 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
     });
     clearScheduleDraftsForUser(from.id);
 
-    const title = await groupTitle(bot.api, id);
+    const title = await groupTitle(api, id);
     await ctx.answerCallbackQuery({ text: "Сохранено" });
     try {
       await ctx.editMessageText(
@@ -210,7 +213,7 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.command("cron", async (ctx) => {
-    if (!requirePrivateAdmin(ctx, admins)) return;
+    if (!assertPrivateChat(ctx)) return;
 
     if (whitelistChatIds.length === 0) {
       await ctx.reply(
@@ -226,11 +229,16 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
     const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
     if (targetId == null) return;
 
+    if (!(await canConfigureGroup(ctx.from.id, targetId))) {
+      await ctx.reply(NO_ACCESS);
+      return;
+    }
+
     const row = await prisma.groupCronSettings.findUnique({
       where: { telegramChatId: String(targetId) },
     });
 
-    const title = await groupTitle(bot.api, targetId);
+    const title = await groupTitle(api, targetId);
 
     const autoLine = row?.cronDisabled
       ? "Автоопрос и авто-матчинг: выключены (/scheduleon — включить снова)."
@@ -241,17 +249,17 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
       : `Часовой пояс для cron: по умолчанию ${DEFAULT_CRON_TIMEZONE} (константа в коде). Свой пояс для этой группы: /crontz`;
 
     let pollLine: string;
-    if (row?.pollWeekday != null && row.pollHour != null) {
+    if (row?.pollWeekday != null && row?.pollHour != null) {
       const m = row.pollMinute ?? 0;
-      pollLine = `Опрос: ${formatWeekdayRu(row.pollWeekday)} ${pad2(row.pollHour)}:${pad2(m)} (бот), cron: ${toWeeklyCronExpression(row.pollWeekday, row.pollHour, m)}`;
+      pollLine = `Опрос: ${formatWeekdayRu(row.pollWeekday)} ${pad2(row.pollHour)}:${pad2(m)}`;
     } else {
       pollLine = "Опрос: не задан. Настрой: /schedule";
     }
 
     let matchLine: string;
-    if (row?.matchWeekday != null && row.matchHour != null) {
+    if (row?.matchWeekday != null && row?.matchHour != null) {
       const m = row.matchMinute ?? 0;
-      matchLine = `Матчинг: ${formatWeekdayRu(row.matchWeekday)} ${pad2(row.matchHour)}:${pad2(m)} (бот), cron: ${toWeeklyCronExpression(row.matchWeekday, row.matchHour, m)}`;
+      matchLine = `Матчинг: ${formatWeekdayRu(row.matchWeekday)} ${pad2(row.matchHour)}:${pad2(m)}`;
     } else {
       matchLine = "Матчинг: не задан. Настрой: /schedule";
     }
@@ -269,50 +277,52 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
         pollLine,
         "",
         matchLine,
-        "",
-        "Команды (в этой личке):",
-        "/settings — сменить группу",
-        "/schedule — кнопки: день недели, затем время чч:мм сообщением",
-        "/scheduleoff — выключить авто-опрос и авто-пары для этой группы",
-        "/scheduleon — снова включить",
-        "/crontz Europe/Minsk — пояс только для этой группы",
-        "/cron — это сообщение",
       ].join("\n")
     );
   });
 
   bot.command("schedule", async (ctx) => {
-    if (!requirePrivateAdmin(ctx, admins)) return;
+    if (!assertPrivateChat(ctx)) return;
     const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
     if (targetId == null) return;
+    if (!(await canConfigureGroup(ctx.from.id, targetId))) {
+      await ctx.reply(NO_ACCESS);
+      return;
+    }
 
-    clearScheduleDraft(targetId, ctx.from!.id);
+    clearScheduleDraft(targetId, ctx.from.id);
     await ctx.reply("Что настраиваем?", { reply_markup: scheduleRootKeyboard() });
   });
 
-  async function assertPrivateAdminCallback(ctx: Context): Promise<boolean> {
+  /** Resolves target + auth; `null` if failed (replies / answers callback as needed). */
+  async function assertScheduleCallback(ctx: Context): Promise<number | null> {
     if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
       await ctx.answerCallbackQuery();
-      return false;
+      return null;
     }
-    if (!ctx.from || !admins.has(ctx.from.id)) {
-      await ctx.answerCallbackQuery({ text: "Только для админов.", show_alert: true });
-      return false;
+    if (!ctx.from) {
+      await ctx.answerCallbackQuery();
+      return null;
     }
     if (ctx.chat?.type !== "private") {
       await ctx.answerCallbackQuery();
-      return false;
+      return null;
     }
-    return true;
+    const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
+    if (targetId == null) {
+      await ctx.answerCallbackQuery();
+      return null;
+    }
+    if (!(await canConfigureGroup(ctx.from.id, targetId))) {
+      await ctx.answerCallbackQuery({ text: NO_ACCESS, show_alert: true });
+      return null;
+    }
+    return targetId;
   }
 
   bot.callbackQuery("sch:menu", async (ctx) => {
-    if (!(await assertPrivateAdminCallback(ctx))) return;
-    const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
-    if (targetId == null) {
-      await ctx.answerCallbackQuery({ text: "Выбери группу: /settings", show_alert: true });
-      return;
-    }
+    const targetId = await assertScheduleCallback(ctx);
+    if (targetId == null) return;
     clearScheduleDraft(targetId, ctx.from!.id);
     await ctx.answerCallbackQuery();
     try {
@@ -323,12 +333,10 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.callbackQuery("sch:x", async (ctx) => {
-    if (!(await assertPrivateAdminCallback(ctx))) return;
+    const targetId = await assertScheduleCallback(ctx);
+    if (targetId == null) return;
     const from = ctx.from!;
-    const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
-    if (targetId != null) {
-      clearScheduleDraft(targetId, from.id);
-    }
+    clearScheduleDraft(targetId, from.id);
     await ctx.answerCallbackQuery();
     try {
       await ctx.editMessageText("Отменено.");
@@ -338,12 +346,8 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.callbackQuery("sch:p", async (ctx) => {
-    if (!(await assertPrivateAdminCallback(ctx))) return;
-    const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
-    if (targetId == null) {
-      await ctx.answerCallbackQuery({ text: "Выбери группу: /settings", show_alert: true });
-      return;
-    }
+    const targetId = await assertScheduleCallback(ctx);
+    if (targetId == null) return;
     await ctx.answerCallbackQuery();
     try {
       await ctx.editMessageText("День недели для опроса:", { reply_markup: weekdayKeyboard("p") });
@@ -353,12 +357,8 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.callbackQuery("sch:m", async (ctx) => {
-    if (!(await assertPrivateAdminCallback(ctx))) return;
-    const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
-    if (targetId == null) {
-      await ctx.answerCallbackQuery({ text: "Выбери группу: /settings", show_alert: true });
-      return;
-    }
+    const targetId = await assertScheduleCallback(ctx);
+    if (targetId == null) return;
     await ctx.answerCallbackQuery();
     try {
       await ctx.editMessageText("День недели для матчинга:", { reply_markup: weekdayKeyboard("m") });
@@ -368,12 +368,8 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.callbackQuery(/^p:d:([0-6])$/, async (ctx) => {
-    if (!(await assertPrivateAdminCallback(ctx))) return;
-    const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
-    if (targetId == null) {
-      await ctx.answerCallbackQuery({ text: "Выбери группу: /settings", show_alert: true });
-      return;
-    }
+    const targetId = await assertScheduleCallback(ctx);
+    if (targetId == null) return;
     const weekday = Number(ctx.match![1]);
     setScheduleDraft({
       kind: "poll",
@@ -396,12 +392,8 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.callbackQuery(/^m:d:([0-6])$/, async (ctx) => {
-    if (!(await assertPrivateAdminCallback(ctx))) return;
-    const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
-    if (targetId == null) {
-      await ctx.answerCallbackQuery({ text: "Выбери группу: /settings", show_alert: true });
-      return;
-    }
+    const targetId = await assertScheduleCallback(ctx);
+    if (targetId == null) return;
     const weekday = Number(ctx.match![1]);
     setScheduleDraft({
       kind: "match",
@@ -424,9 +416,13 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.command("crontz", async (ctx) => {
-    if (!requirePrivateAdmin(ctx, admins)) return;
+    if (!assertPrivateChat(ctx)) return;
     const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
     if (targetId == null) return;
+    if (!(await canConfigureGroup(ctx.from.id, targetId))) {
+      await ctx.reply(NO_ACCESS);
+      return;
+    }
 
     const tzRaw = tailAfterCommand(ctx.message?.text ?? "");
     if (!tzRaw) {
@@ -452,9 +448,13 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.command("scheduleoff", async (ctx) => {
-    if (!requirePrivateAdmin(ctx, admins)) return;
+    if (!assertPrivateChat(ctx)) return;
     const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
     if (targetId == null) return;
+    if (!(await canConfigureGroup(ctx.from.id, targetId))) {
+      await ctx.reply(NO_ACCESS);
+      return;
+    }
 
     await prisma.groupCronSettings.upsert({
       where: { telegramChatId: String(targetId) },
@@ -469,9 +469,13 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
   });
 
   bot.command("scheduleon", async (ctx) => {
-    if (!requirePrivateAdmin(ctx, admins)) return;
+    if (!assertPrivateChat(ctx)) return;
     const targetId = await resolveDmTargetGroupId(ctx, whitelistChatIds);
     if (targetId == null) return;
+    if (!(await canConfigureGroup(ctx.from.id, targetId))) {
+      await ctx.reply(NO_ACCESS);
+      return;
+    }
 
     await prisma.groupCronSettings.upsert({
       where: { telegramChatId: String(targetId) },
@@ -489,7 +493,7 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
       const chat = ctx.chat;
       const from = ctx.from;
       if (!chat || chat.type !== "private") return false;
-      if (!from || !admins.has(from.id)) return false;
+      if (!from) return false;
       const t = ctx.message.text.trim();
       if (t.startsWith("/")) return false;
       return hasScheduleDraftForUser(from.id);
@@ -501,6 +505,11 @@ export function registerCronSettingCommands(bot: Bot, deps: Deps): void {
         rawTarget && whitelistChatIds.includes(Number(rawTarget)) ? Number(rawTarget) : null;
       if (targetId == null) {
         await ctx.reply("Сначала выбери группу: /settings");
+        return;
+      }
+
+      if (!(await canConfigureGroup(from.id, targetId))) {
+        await ctx.reply(NO_ACCESS);
         return;
       }
 
